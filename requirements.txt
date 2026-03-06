@@ -1,0 +1,6 @@
+discord.py
+deepl
+python-dotenv
+Flask
+pymongo
+openai
