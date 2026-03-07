@@ -1,2 +1,7 @@
 
 .env
+
+# Python bytecode/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
