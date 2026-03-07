@@ -1,5 +1,49 @@
 # DiscoBot
 
+Discord bot for moderation, translation, gamification, scheduling, AI image generation, and website integration.
+
+## Quick start
+
+### Requirements
+
+- Python 3.10+
+- MongoDB connection string
+- Discord bot token
+- DeepL API key
+
+### Install and run
+
+1. Create and activate a virtual environment.
+2. Install dependencies:
+   - `pip install -r requirements.txt`
+3. Set required environment variables.
+4. Start the bot:
+   - `python main.py`
+
+### Required environment variables
+
+- `DISCORD_TOKEN`
+- `MONGODB_URI`
+- `DEEPL_AUTH_KEY`
+
+### Optional environment variables
+
+- `OPENAI_API_KEY` (enables AI image generation; feature is unavailable without it)
+- `WEBSITE_BASE_URL` (default: `http://localhost:3000`)
+- `SINGLE_USER_MODE=true` (testing override for reputation cooldown/self-award checks)
+- `DEBUG=true` (extra debug logging in supported cogs)
+
+## Loaded cogs
+
+- `translation`
+- `mongodb`
+- `ai_image_generation`
+- `moderation`
+- `gamification`
+- `features`
+- `scheduler`
+- `website_link`
+
 ## Translation data files
 
 The translation cog reads JSON data from:
@@ -100,6 +144,15 @@ The gamification cog awards XP as users chat, tracks levels, and posts a leaderb
 
 All XP, level, reputation, and moderation stats are stored per guild/per user in MongoDB collection `discordguilds.user_data`.
 
+## Translation
+
+Translation is available via message context menu commands:
+
+- `Translate`
+- `Translate (Private)`
+
+The bot also supports flag-reaction translation using data from `data/translation/`.
+
 ## AI Image Credits
 
 The AI image generation context-menu feature now enforces per-user credits per guild.
@@ -115,7 +168,7 @@ The AI image generation context-menu feature now enforces per-user credits per g
 ### Optional environment variable
 
 - `WEBSITE_BASE_URL` (default: `http://localhost:3000`)
-   - Used by the bot to build the “buy more credits” URL.
+   - Used by the bot to build website links for buying credits.
 
 ### Testing override
 
