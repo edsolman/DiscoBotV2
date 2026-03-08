@@ -22,7 +22,7 @@ Discord bot for moderation, translation, gamification, scheduling, AI image gene
 
 ### Required environment variables
 
-- `DISCORD_TOKEN`
+- `DISCORD_BOT_TOKEN`
 - `MONGODB_URI`
 - `DEEPL_AUTH_KEY`
 

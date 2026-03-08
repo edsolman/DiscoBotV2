@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 # Get the Discord token from environment variables
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 
 # Set up intents
 intents = discord.Intents.default()
@@ -72,4 +72,4 @@ async def on_guild_join(guild: discord.Guild):
         print(f"[ERROR] Error registering guild {guild.name}: {error}")
 
 
-bot.run(DISCORD_TOKEN)
+bot.run(DISCORD_BOT_TOKEN)

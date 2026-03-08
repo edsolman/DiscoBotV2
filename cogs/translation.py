@@ -86,6 +86,25 @@ class TranslationCog(commands.Cog):
         except Exception as error:
             print(f"[DEBUG] Error retrieving translation character usage for guild {guild_id}: {error}")
 
+    @staticmethod
+    def _format_character_budget_message(budget: dict) -> str:
+        guild_used = int(budget.get("guild_used", 0) or 0)
+        guild_allowance = int(budget.get("guild_allowance", 0) or 0)
+        personal_used = int(budget.get("personal_used", 0) or 0)
+        personal_allowance = int(budget.get("personal_allowance", 0) or 0)
+
+        if personal_allowance > 0:
+            return (
+                "⚠️ Translation character limit exceeded! "
+                f"Guild usage is {guild_used}/{guild_allowance} and your personal translation usage is "
+                f"{personal_used}/{personal_allowance} characters this month."
+            )
+
+        return (
+            "⚠️ Translation character limit exceeded! "
+            f"This server has used {guild_used}/{guild_allowance} characters this month."
+        )
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if self.debug:
@@ -200,23 +219,24 @@ class TranslationCog(commands.Cog):
                 await channel.send(f"Oops, There has been an error: {str(e)}")
             return
 
-        # Check translation character limit if this is in a guild
+        # Check translation character budget (guild pool first, then personal pool)
+        character_budget_source = "guild"
         if payload.guild_id:
             mongo_cog = self.bot.get_cog("MongoDbCog")
             if mongo_cog:
                 try:
-                    can_translate, current_count, allowance = await mongo_cog.check_translation_character_limit(
-                        payload.guild_id
+                    budget = await mongo_cog.check_translation_character_budget(
+                        payload.guild_id,
+                        payload.user_id,
+                        len(message.content),
                     )
-                    if not can_translate or current_count + len(message.content) > allowance:
-                        await channel.send(
-                            f"⚠️ Translation character limit exceeded! "
-                            f"This server has used {current_count}/{allowance} characters this month."
-                        )
+                    if not budget.get("can_translate", False):
+                        await channel.send(self._format_character_budget_message(budget))
                         return
+                    character_budget_source = str(budget.get("source") or "guild")
                 except Exception as e:
                     if self.debug:
-                        print(f"[DEBUG] Error checking translation character limit: {e}")
+                        print(f"[DEBUG] Error checking translation character budget: {e}")
                     # Continue with translation if we can't check the limit
 
         try:
@@ -263,20 +283,28 @@ class TranslationCog(commands.Cog):
 
             await channel.send(reference=message, content="", embed=embed)
             
-            # Increment translation count
+            # Consume translation usage
             if payload.guild_id:
                 mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog:
                     try:
-                        await mongo_cog.increment_translation_count(payload.guild_id)
-                        await mongo_cog.increment_translation_character_count(
+                        usage_result = await mongo_cog.consume_translation_character_usage(
                             payload.guild_id,
+                            payload.user_id,
+                            member.display_name if member is not None else "Unknown",
                             len(message.content),
+                            source_hint=character_budget_source,
                         )
-                        await self._debug_log_character_usage(payload.guild_id, len(message.content))
+                        if self.debug:
+                            print(
+                                "[DEBUG] Translation usage consumed "
+                                f"source={usage_result.get('source')} "
+                                f"guild={usage_result.get('guild_used')}/{usage_result.get('guild_allowance')} "
+                                f"personal={usage_result.get('personal_used')}/{usage_result.get('personal_allowance')}"
+                            )
                     except Exception as e:
                         if self.debug:
-                            print(f"[DEBUG] Error incrementing translation count: {e}")
+                            print(f"[DEBUG] Error consuming translation usage: {e}")
         except Exception as e:
             await channel.send(f"Oops, There has been an error: {str(e)}")
 
@@ -353,24 +381,24 @@ class TranslationCog(commands.Cog):
                 await interaction.response.send_message(f"Oops, There has been an error: {str(e)}", ephemeral=True)
             return
 
-        # Check translation character limit
+        # Check translation character budget (guild pool first, then personal pool)
+        character_budget_source = "guild"
         if interaction.guild_id:
             mongo_cog = self.bot.get_cog("MongoDbCog")
             if mongo_cog:
                 try:
-                    can_translate, current_count, allowance = await mongo_cog.check_translation_character_limit(
-                        interaction.guild_id
+                    budget = await mongo_cog.check_translation_character_budget(
+                        interaction.guild_id,
+                        interaction.user.id,
+                        len(message.content),
                     )
-                    if not can_translate or current_count + len(message.content) > allowance:
-                        await interaction.response.send_message(
-                            f"⚠️ Translation character limit exceeded! "
-                            f"This server has used {current_count}/{allowance} characters this month.",
-                            ephemeral=True,
-                        )
+                    if not budget.get("can_translate", False):
+                        await interaction.response.send_message(self._format_character_budget_message(budget), ephemeral=True)
                         return
+                    character_budget_source = str(budget.get("source") or "guild")
                 except Exception as e:
                     if self.debug:
-                        print(f"[DEBUG] Error checking translation character limit: {e}")
+                        print(f"[DEBUG] Error checking translation character budget: {e}")
                     # Continue with translation if we can't check the limit
 
         try:
@@ -423,20 +451,28 @@ class TranslationCog(commands.Cog):
 
             await interaction.response.send_message(embeds=[embed, embed2])
             
-            # Increment translation count
+            # Consume translation usage
             if interaction.guild_id:
                 mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog:
                     try:
-                        await mongo_cog.increment_translation_count(interaction.guild_id)
-                        await mongo_cog.increment_translation_character_count(
+                        usage_result = await mongo_cog.consume_translation_character_usage(
                             interaction.guild_id,
+                            interaction.user.id,
+                            interaction.user.display_name,
                             len(message.content),
+                            source_hint=character_budget_source,
                         )
-                        await self._debug_log_character_usage(interaction.guild_id, len(message.content))
+                        if self.debug:
+                            print(
+                                "[DEBUG] Translation usage consumed "
+                                f"source={usage_result.get('source')} "
+                                f"guild={usage_result.get('guild_used')}/{usage_result.get('guild_allowance')} "
+                                f"personal={usage_result.get('personal_used')}/{usage_result.get('personal_allowance')}"
+                            )
                     except Exception as e:
                         if self.debug:
-                            print(f"[DEBUG] Error incrementing translation count: {e}")
+                            print(f"[DEBUG] Error consuming translation usage: {e}")
         except Exception as e:
             await interaction.response.send_message(f"Oops, There has been an error: {str(e)}", ephemeral=True)
 
@@ -513,24 +549,24 @@ class TranslationCog(commands.Cog):
                 await interaction.response.send_message(f"Oops, There has been an error: {str(e)}", ephemeral=True)
             return
 
-        # Check translation character limit
+        # Check translation character budget (guild pool first, then personal pool)
+        character_budget_source = "guild"
         if interaction.guild_id:
             mongo_cog = self.bot.get_cog("MongoDbCog")
             if mongo_cog:
                 try:
-                    can_translate, current_count, allowance = await mongo_cog.check_translation_character_limit(
-                        interaction.guild_id
+                    budget = await mongo_cog.check_translation_character_budget(
+                        interaction.guild_id,
+                        interaction.user.id,
+                        len(message.content),
                     )
-                    if not can_translate or current_count + len(message.content) > allowance:
-                        await interaction.response.send_message(
-                            f"⚠️ Translation character limit exceeded! "
-                            f"This server has used {current_count}/{allowance} characters this month.",
-                            ephemeral=True,
-                        )
+                    if not budget.get("can_translate", False):
+                        await interaction.response.send_message(self._format_character_budget_message(budget), ephemeral=True)
                         return
+                    character_budget_source = str(budget.get("source") or "guild")
                 except Exception as e:
                     if self.debug:
-                        print(f"[DEBUG] Error checking translation character limit: {e}")
+                        print(f"[DEBUG] Error checking translation character budget: {e}")
                     # Continue with translation if we can't check the limit
 
         try:
@@ -583,20 +619,28 @@ class TranslationCog(commands.Cog):
 
             await interaction.response.send_message(embeds=[embed, embed2], ephemeral=True)
             
-            # Increment translation count
+            # Consume translation usage
             if interaction.guild_id:
                 mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog:
                     try:
-                        await mongo_cog.increment_translation_count(interaction.guild_id)
-                        await mongo_cog.increment_translation_character_count(
+                        usage_result = await mongo_cog.consume_translation_character_usage(
                             interaction.guild_id,
+                            interaction.user.id,
+                            interaction.user.display_name,
                             len(message.content),
+                            source_hint=character_budget_source,
                         )
-                        await self._debug_log_character_usage(interaction.guild_id, len(message.content))
+                        if self.debug:
+                            print(
+                                "[DEBUG] Translation usage consumed "
+                                f"source={usage_result.get('source')} "
+                                f"guild={usage_result.get('guild_used')}/{usage_result.get('guild_allowance')} "
+                                f"personal={usage_result.get('personal_used')}/{usage_result.get('personal_allowance')}"
+                            )
                     except Exception as e:
                         if self.debug:
-                            print(f"[DEBUG] Error incrementing translation count: {e}")
+                            print(f"[DEBUG] Error consuming translation usage: {e}")
         except Exception as e:
             await interaction.response.send_message(f"Oops, There has been an error: {str(e)}", ephemeral=True)
 

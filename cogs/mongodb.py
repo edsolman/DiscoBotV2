@@ -18,6 +18,12 @@ class MongoDbCog(commands.Cog):
         "translation",
         "scheduled_messages",
     )
+    ACTIVE_SUBSCRIPTION_STATUSES: tuple[str, ...] = (
+        "active",
+        "trialing",
+        "past_due",
+        "unpaid",
+    )
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -347,6 +353,269 @@ class MongoDbCog(commands.Cog):
             return (can_translate, current_count, allowance)
 
         return await asyncio.to_thread(_check_limit)
+
+    async def check_translation_character_budget(
+        self,
+        guild_id: int,
+        user_id: int,
+        character_count: int,
+    ) -> dict[str, Any]:
+        def _check_budget() -> dict[str, Any]:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            guilds_collection = db["guilds"]
+            data_collection = db["guild_data"]
+            subscriptions_collection = db["translation_character_subscriptions"]
+            user_usage_collection = db["translation_character_user_usage"]
+
+            safe_character_count = max(int(character_count or 0), 0)
+            now = datetime.utcnow()
+            year = now.year
+            month = now.month
+
+            guild = guilds_collection.find_one({"guild_id": guild_id})
+            guild_allowance = int(guild.get("translationcharacterallowance", 10000)) if guild else 10000
+            monthly_guild_data = data_collection.find_one({
+                "guild_id": guild_id,
+                "year": year,
+                "month": month,
+            })
+            guild_used = int(monthly_guild_data.get("translation_character_count", 0)) if monthly_guild_data else 0
+            guild_remaining = max(guild_allowance - guild_used, 0)
+
+            user_id_candidates = [user_id, str(user_id)]
+            personal_allowance_rows = list(
+                subscriptions_collection.aggregate(
+                    [
+                        {
+                            "$match": {
+                                "purchase_scope": "translation_user_personal",
+                                "user_id": {"$in": user_id_candidates},
+                                "status": {"$in": list(self.ACTIVE_SUBSCRIPTION_STATUSES)},
+                            }
+                        },
+                        {
+                            "$group": {
+                                "_id": None,
+                                "characters_per_month": {"$sum": "$characters_per_month"},
+                            }
+                        },
+                    ]
+                )
+            )
+            personal_allowance = int(personal_allowance_rows[0].get("characters_per_month", 0)) if personal_allowance_rows else 0
+
+            personal_usage_doc = user_usage_collection.find_one(
+                {
+                    "user_id": {"$in": user_id_candidates},
+                    "year": year,
+                    "month": month,
+                },
+                {"translation_character_count": 1},
+            )
+            personal_used = int(personal_usage_doc.get("translation_character_count", 0)) if personal_usage_doc else 0
+            personal_remaining = max(personal_allowance - personal_used, 0)
+
+            if guild_remaining >= safe_character_count:
+                source = "guild"
+                can_translate = True
+            elif personal_remaining >= safe_character_count:
+                source = "personal"
+                can_translate = True
+            else:
+                source = "none"
+                can_translate = False
+
+            return {
+                "can_translate": can_translate,
+                "source": source,
+                "character_count": safe_character_count,
+                "guild_used": guild_used,
+                "guild_allowance": guild_allowance,
+                "guild_remaining": guild_remaining,
+                "personal_used": personal_used,
+                "personal_allowance": personal_allowance,
+                "personal_remaining": personal_remaining,
+            }
+
+        return await asyncio.to_thread(_check_budget)
+
+    async def consume_translation_character_usage(
+        self,
+        guild_id: int,
+        user_id: int,
+        username: str,
+        character_count: int,
+        source_hint: str | None = None,
+    ) -> dict[str, Any]:
+        def _consume_usage() -> dict[str, Any]:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            guilds_collection = db["guilds"]
+            data_collection = db["guild_data"]
+            subscriptions_collection = db["translation_character_subscriptions"]
+            user_usage_collection = db["translation_character_user_usage"]
+
+            safe_character_count = max(int(character_count or 0), 0)
+            if safe_character_count <= 0:
+                return {
+                    "consumed": False,
+                    "source": "none",
+                    "guild_used": 0,
+                    "guild_allowance": 0,
+                    "guild_remaining": 0,
+                    "personal_used": 0,
+                    "personal_allowance": 0,
+                    "personal_remaining": 0,
+                }
+
+            now = datetime.utcnow()
+            year = now.year
+            month = now.month
+
+            def get_budget_snapshot() -> dict[str, int]:
+                guild = guilds_collection.find_one({"guild_id": guild_id})
+                guild_allowance = int(guild.get("translationcharacterallowance", 10000)) if guild else 10000
+                monthly_guild_data = data_collection.find_one({
+                    "guild_id": guild_id,
+                    "year": year,
+                    "month": month,
+                })
+                guild_used = int(monthly_guild_data.get("translation_character_count", 0)) if monthly_guild_data else 0
+                guild_remaining = max(guild_allowance - guild_used, 0)
+
+                user_id_candidates = [user_id, str(user_id)]
+                personal_allowance_rows = list(
+                    subscriptions_collection.aggregate(
+                        [
+                            {
+                                "$match": {
+                                    "purchase_scope": "translation_user_personal",
+                                    "user_id": {"$in": user_id_candidates},
+                                    "status": {"$in": list(self.ACTIVE_SUBSCRIPTION_STATUSES)},
+                                }
+                            },
+                            {
+                                "$group": {
+                                    "_id": None,
+                                    "characters_per_month": {"$sum": "$characters_per_month"},
+                                }
+                            },
+                        ]
+                    )
+                )
+                personal_allowance = int(personal_allowance_rows[0].get("characters_per_month", 0)) if personal_allowance_rows else 0
+
+                personal_usage_doc = user_usage_collection.find_one(
+                    {
+                        "user_id": {"$in": user_id_candidates},
+                        "year": year,
+                        "month": month,
+                    },
+                    {"translation_character_count": 1},
+                )
+                personal_used = int(personal_usage_doc.get("translation_character_count", 0)) if personal_usage_doc else 0
+                personal_remaining = max(personal_allowance - personal_used, 0)
+
+                return {
+                    "guild_used": guild_used,
+                    "guild_allowance": guild_allowance,
+                    "guild_remaining": guild_remaining,
+                    "personal_used": personal_used,
+                    "personal_allowance": personal_allowance,
+                    "personal_remaining": personal_remaining,
+                }
+
+            budget = get_budget_snapshot()
+            ordered_sources = ["guild", "personal"]
+            if source_hint == "personal" and budget["guild_remaining"] < safe_character_count:
+                ordered_sources = ["personal", "guild"]
+
+            consumed_source = "none"
+            if "guild" in ordered_sources and budget["guild_remaining"] >= safe_character_count:
+                data_collection.update_one(
+                    {
+                        "guild_id": guild_id,
+                        "year": year,
+                        "month": month,
+                    },
+                    {
+                        "$setOnInsert": {
+                            "guild_id": guild_id,
+                            "year": year,
+                            "month": month,
+                            "ai_image_gen_count": 0,
+                            "translation_count": 0,
+                            "translation_character_count": 0,
+                        },
+                        "$inc": {
+                            "translation_count": 1,
+                            "translation_character_count": safe_character_count,
+                        },
+                    },
+                    upsert=True,
+                )
+                consumed_source = "guild"
+            elif "personal" in ordered_sources and budget["personal_remaining"] >= safe_character_count:
+                data_collection.update_one(
+                    {
+                        "guild_id": guild_id,
+                        "year": year,
+                        "month": month,
+                    },
+                    {
+                        "$setOnInsert": {
+                            "guild_id": guild_id,
+                            "year": year,
+                            "month": month,
+                            "ai_image_gen_count": 0,
+                            "translation_count": 0,
+                            "translation_character_count": 0,
+                        },
+                        "$inc": {
+                            "translation_count": 1,
+                        },
+                    },
+                    upsert=True,
+                )
+
+                user_usage_collection.update_one(
+                    {
+                        "user_id": user_id,
+                        "year": year,
+                        "month": month,
+                    },
+                    {
+                        "$setOnInsert": {
+                            "user_id": user_id,
+                            "year": year,
+                            "month": month,
+                            "username": username,
+                            "translation_character_count": 0,
+                            "created_at": now,
+                        },
+                        "$set": {
+                            "username": username,
+                            "updated_at": now,
+                        },
+                        "$inc": {
+                            "translation_character_count": safe_character_count,
+                        },
+                    },
+                    upsert=True,
+                )
+                consumed_source = "personal"
+
+            next_budget = get_budget_snapshot()
+            return {
+                "consumed": consumed_source != "none",
+                "source": consumed_source,
+                **next_budget,
+            }
+
+        return await asyncio.to_thread(_consume_usage)
 
     async def increment_translation_count(self, guild_id: int) -> int:
         """
@@ -726,6 +995,8 @@ class MongoDbCog(commands.Cog):
             db = self.client["discordguilds"]
             collection = db["user_data"]
             ai_image_user_credits_collection = db["ai_image_user_credits"]
+            translation_user_usage_collection = db["translation_character_user_usage"]
+            translation_subscriptions_collection = db["translation_character_subscriptions"]
             collection.create_index(
                 [("guild_id", 1), ("user_id", 1)],
                 unique=True,
@@ -751,6 +1022,15 @@ class MongoDbCog(commands.Cog):
                 [("user_id", 1)],
                 unique=True,
                 name="user_credit_wallet_unique_idx",
+            )
+            translation_user_usage_collection.create_index(
+                [("user_id", 1), ("year", 1), ("month", 1)],
+                unique=True,
+                name="translation_user_month_unique_idx",
+            )
+            translation_subscriptions_collection.create_index(
+                [("purchase_scope", 1), ("user_id", 1), ("status", 1)],
+                name="translation_personal_subscription_status_idx",
             )
 
         return await asyncio.to_thread(_ensure_indexes)
