@@ -120,7 +120,7 @@ class TranslationCog(commands.Cog):
         fallback_channel,
         message: str,
     ):
-        # Raw reaction events do not support ephemeral responses, so prefer DM for private notices.
+        # Raw reaction events do not support ephemeral responses; send DM only.
         try:
             user = self.bot.get_user(user_id)
             if user is None:
@@ -130,9 +130,8 @@ class TranslationCog(commands.Cog):
         except Exception as error:
             if self.debug:
                 print(f"[DEBUG] Could not DM private limit notice to user {user_id}: {error}")
-
-        # Fallback only when DM cannot be delivered.
-        await fallback_channel.send(message, delete_after=10)
+            # No public fallback, to preserve privacy expectations.
+            return
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

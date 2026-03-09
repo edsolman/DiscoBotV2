@@ -28,6 +28,7 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.features")
         await self.load_extension("cogs.scheduler")
         await self.load_extension("cogs.website_link")
+        await self.load_extension("cogs.credits")
         await self.tree.sync()
 
 bot = MyBot()
