@@ -288,27 +288,26 @@ class MongoDbCog(commands.Cog):
         def _check_and_insert():
             db = self.client["discordguilds"]
             collection = db["guild_data"]
-            
-            # Check if record already exists for this month
-            existing = collection.find_one({
-                "guild_id": guild_id,
-                "year": year,
-                "month": month
-            })
-            if existing:
-                return False
-            
-            # Insert new monthly record
-            monthly_record = {
-                "guild_id": guild_id,
-                "year": year,
-                "month": month,
-                "translation_count": 0,
-                "translation_character_count": 0,
-                "ai_image_gen_count": 0
-            }
-            collection.insert_one(monthly_record)
-            return True
+
+            result = collection.update_one(
+                {
+                    "guild_id": guild_id,
+                    "year": year,
+                    "month": month,
+                },
+                {
+                    "$setOnInsert": {
+                        "guild_id": guild_id,
+                        "year": year,
+                        "month": month,
+                        "translation_count": 0,
+                        "translation_character_count": 0,
+                        "ai_image_gen_count": 0,
+                    },
+                },
+                upsert=True,
+            )
+            return result.upserted_id is not None
         
         return await asyncio.to_thread(_check_and_insert)
 
@@ -488,6 +487,162 @@ class MongoDbCog(commands.Cog):
 
         return await asyncio.to_thread(_check_budget)
 
+    async def check_personal_translation_character_budget(
+        self,
+        user_id: int,
+        character_count: int,
+    ) -> dict[str, Any]:
+        def _check_budget() -> dict[str, Any]:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            subscriptions_collection = db["translation_character_subscriptions"]
+            user_usage_collection = db["translation_character_user_usage"]
+
+            safe_character_count = max(int(character_count or 0), 0)
+            now = datetime.utcnow()
+            year = now.year
+            month = now.month
+
+            user_id_candidates = [user_id, str(user_id)]
+            personal_allowance_rows = list(
+                subscriptions_collection.aggregate(
+                    [
+                        {
+                            "$match": {
+                                "purchase_scope": "translation_user_personal",
+                                "user_id": {"$in": user_id_candidates},
+                                "status": {"$in": list(self.ACTIVE_SUBSCRIPTION_STATUSES)},
+                            }
+                        },
+                        {
+                            "$group": {
+                                "_id": None,
+                                "characters_per_month": {"$sum": "$characters_per_month"},
+                            }
+                        },
+                    ]
+                )
+            )
+            personal_allowance = int(personal_allowance_rows[0].get("characters_per_month", 0)) if personal_allowance_rows else 0
+
+            personal_usage_doc = user_usage_collection.find_one(
+                {
+                    "user_id": {"$in": user_id_candidates},
+                    "year": year,
+                    "month": month,
+                },
+                {"translation_character_count": 1},
+            )
+            personal_used = int(personal_usage_doc.get("translation_character_count", 0)) if personal_usage_doc else 0
+            personal_remaining = max(personal_allowance - personal_used, 0)
+
+            return {
+                "can_translate": personal_remaining >= safe_character_count,
+                "source": "personal" if personal_remaining >= safe_character_count else "none",
+                "character_count": safe_character_count,
+                "personal_used": personal_used,
+                "personal_allowance": personal_allowance,
+                "personal_remaining": personal_remaining,
+            }
+
+        return await asyncio.to_thread(_check_budget)
+
+    async def consume_personal_translation_character_usage(
+        self,
+        user_id: int,
+        username: str,
+        character_count: int,
+    ) -> dict[str, Any]:
+        def _consume_usage() -> dict[str, Any]:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            subscriptions_collection = db["translation_character_subscriptions"]
+            user_usage_collection = db["translation_character_user_usage"]
+
+            safe_character_count = max(int(character_count or 0), 0)
+            if safe_character_count <= 0:
+                return {
+                    "consumed": False,
+                    "source": "none",
+                    "personal_used": 0,
+                    "personal_allowance": 0,
+                    "personal_remaining": 0,
+                }
+
+            now = datetime.utcnow()
+            year = now.year
+            month = now.month
+            user_id_candidates = [user_id, str(user_id)]
+
+            personal_allowance_rows = list(
+                subscriptions_collection.aggregate(
+                    [
+                        {
+                            "$match": {
+                                "purchase_scope": "translation_user_personal",
+                                "user_id": {"$in": user_id_candidates},
+                                "status": {"$in": list(self.ACTIVE_SUBSCRIPTION_STATUSES)},
+                            }
+                        },
+                        {
+                            "$group": {
+                                "_id": None,
+                                "characters_per_month": {"$sum": "$characters_per_month"},
+                            }
+                        },
+                    ]
+                )
+            )
+            personal_allowance = int(personal_allowance_rows[0].get("characters_per_month", 0)) if personal_allowance_rows else 0
+
+            result = user_usage_collection.update_one(
+                {
+                    "user_id": {"$in": user_id_candidates},
+                    "year": year,
+                    "month": month,
+                    "translation_character_count": {"$lte": max(personal_allowance - safe_character_count, 0)},
+                },
+                {
+                    "$set": {
+                        "username": username,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "user_id": user_id,
+                        "year": year,
+                        "month": month,
+                        "created_at": now,
+                    },
+                    "$inc": {
+                        "translation_character_count": safe_character_count,
+                    },
+                },
+                upsert=True,
+            )
+
+            personal_usage_doc = user_usage_collection.find_one(
+                {
+                    "user_id": {"$in": user_id_candidates},
+                    "year": year,
+                    "month": month,
+                },
+                {"translation_character_count": 1},
+            )
+            personal_used = int(personal_usage_doc.get("translation_character_count", 0)) if personal_usage_doc else 0
+            personal_remaining = max(personal_allowance - personal_used, 0)
+
+            return {
+                "consumed": result.modified_count > 0 or result.upserted_id is not None,
+                "source": "personal" if (result.modified_count > 0 or result.upserted_id is not None) else "none",
+                "personal_used": personal_used,
+                "personal_allowance": personal_allowance,
+                "personal_remaining": personal_remaining,
+            }
+
+        return await asyncio.to_thread(_consume_usage)
+
     async def consume_translation_character_usage(
         self,
         guild_id: int,
@@ -594,8 +749,6 @@ class MongoDbCog(commands.Cog):
                             "year": year,
                             "month": month,
                             "ai_image_gen_count": 0,
-                            "translation_count": 0,
-                            "translation_character_count": 0,
                         },
                         "$inc": {
                             "translation_count": 1,
@@ -618,8 +771,6 @@ class MongoDbCog(commands.Cog):
                             "year": year,
                             "month": month,
                             "ai_image_gen_count": 0,
-                            "translation_count": 0,
-                            "translation_character_count": 0,
                         },
                         "$inc": {
                             "translation_count": 1,
@@ -639,8 +790,6 @@ class MongoDbCog(commands.Cog):
                             "user_id": user_id,
                             "year": year,
                             "month": month,
-                            "username": username,
-                            "translation_character_count": 0,
                             "created_at": now,
                         },
                         "$set": {
@@ -685,41 +834,34 @@ class MongoDbCog(commands.Cog):
             year = now.year
             month = now.month
             
-            # Ensure the monthly record exists
-            record = collection.find_one({
-                "guild_id": guild_id,
-                "year": year,
-                "month": month
-            })
-            
-            if not record:
-                # Create the record if it doesn't exist
-                collection.insert_one({
+            collection.update_one(
+                {
                     "guild_id": guild_id,
                     "year": year,
                     "month": month,
-                    "translation_count": 1,
-                    "translation_character_count": 0,
-                    "ai_image_gen_count": 0
-                })
-                return 1
-            else:
-                # Increment the count
-                result = collection.update_one(
-                    {
+                },
+                {
+                    "$setOnInsert": {
                         "guild_id": guild_id,
                         "year": year,
-                        "month": month
+                        "month": month,
+                        "translation_character_count": 0,
+                        "ai_image_gen_count": 0,
                     },
-                    {"$inc": {"translation_count": 1}}
-                )
-                # Return the new count
-                updated_record = collection.find_one({
+                    "$inc": {"translation_count": 1},
+                },
+                upsert=True,
+            )
+
+            updated_record = collection.find_one(
+                {
                     "guild_id": guild_id,
                     "year": year,
-                    "month": month
-                })
-                return updated_record.get("translation_count", 0)
+                    "month": month,
+                },
+                {"translation_count": 1},
+            )
+            return updated_record.get("translation_count", 0) if updated_record else 0
         
         return await asyncio.to_thread(_increment)
 
@@ -744,41 +886,34 @@ class MongoDbCog(commands.Cog):
             year = now.year
             month = now.month
             
-            # Ensure the monthly record exists
-            record = collection.find_one({
-                "guild_id": guild_id,
-                "year": year,
-                "month": month
-            })
-            
-            if not record:
-                # Create the record if it doesn't exist
-                collection.insert_one({
+            collection.update_one(
+                {
                     "guild_id": guild_id,
                     "year": year,
                     "month": month,
-                    "translation_count": 0,
-                    "translation_character_count": 0,
-                    "ai_image_gen_count": 1
-                })
-                return 1
-            else:
-                # Increment the count
-                result = collection.update_one(
-                    {
+                },
+                {
+                    "$setOnInsert": {
                         "guild_id": guild_id,
                         "year": year,
-                        "month": month
+                        "month": month,
+                        "translation_count": 0,
+                        "translation_character_count": 0,
                     },
-                    {"$inc": {"ai_image_gen_count": 1}}
-                )
-                # Return the new count
-                updated_record = collection.find_one({
+                    "$inc": {"ai_image_gen_count": 1},
+                },
+                upsert=True,
+            )
+
+            updated_record = collection.find_one(
+                {
                     "guild_id": guild_id,
                     "year": year,
-                    "month": month
-                })
-                return updated_record.get("ai_image_gen_count", 0)
+                    "month": month,
+                },
+                {"ai_image_gen_count": 1},
+            )
+            return updated_record.get("ai_image_gen_count", 0) if updated_record else 0
         
         return await asyncio.to_thread(_increment)
 
@@ -918,13 +1053,19 @@ class MongoDbCog(commands.Cog):
                 {"guild_id": guild_id, "year": year, "month": month},
                 {"ai_image_gen_count": 1},
             )
-            guild_used = self._to_non_negative_int(monthly_guild_data.get("ai_image_gen_count", 0) if monthly_guild_data else 0, 0)
+            guild_used = self._to_non_negative_int(
+                monthly_guild_data.get("ai_image_gen_count", 0) if monthly_guild_data else 0,
+                0,
+            )
 
             member_usage_doc = member_usage_collection.find_one(
                 {"guild_id": guild_id, "user_id": user_id, "year": year, "month": month},
                 {"ai_image_gen_count": 1},
             )
-            member_used = self._to_non_negative_int(member_usage_doc.get("ai_image_gen_count", 0) if member_usage_doc else 0, 0)
+            member_used = self._to_non_negative_int(
+                member_usage_doc.get("ai_image_gen_count", 0) if member_usage_doc else 0,
+                0,
+            )
 
             if allowance <= 0 or guild_used >= allowance:
                 return {
@@ -956,89 +1097,79 @@ class MongoDbCog(commands.Cog):
                     "member_limit": member_limit,
                 }
 
-            # Reserve 1 guild credit using optimistic concurrency to reduce race over-allocation.
-            guild_credit_reserved = False
-            if monthly_guild_data is None:
-                data_collection.insert_one(
-                    {
+            data_collection.update_one(
+                {"guild_id": guild_id, "year": year, "month": month},
+                {
+                    "$setOnInsert": {
                         "guild_id": guild_id,
                         "year": year,
                         "month": month,
                         "translation_count": 0,
                         "translation_character_count": 0,
-                        "ai_image_gen_count": 1,
+                        "ai_image_gen_count": 0,
                     }
-                )
-                guild_credit_reserved = True
-                guild_used_after = 1
-            else:
-                guild_update = data_collection.update_one(
-                    {
-                        "_id": monthly_guild_data["_id"],
-                        "ai_image_gen_count": guild_used,
-                    },
-                    {"$inc": {"ai_image_gen_count": 1}},
-                )
-                if guild_update.modified_count > 0:
-                    guild_credit_reserved = True
-                    guild_used_after = guild_used + 1
-                else:
-                    latest = data_collection.find_one(
-                        {"guild_id": guild_id, "year": year, "month": month},
-                        {"ai_image_gen_count": 1},
-                    )
-                    latest_used = self._to_non_negative_int(latest.get("ai_image_gen_count", 0) if latest else 0, 0)
-                    return {
-                        "consumed": False,
-                        "reason": "guild_allowance_reached",
-                        "guild_used": latest_used,
-                        "guild_allowance": allowance,
-                        "member_used": member_used,
-                        "member_limit": member_limit,
-                    }
+                },
+                upsert=True,
+            )
 
-            if not guild_credit_reserved:
+            guild_update = data_collection.update_one(
+                {
+                    "guild_id": guild_id,
+                    "year": year,
+                    "month": month,
+                    "ai_image_gen_count": {"$lt": allowance},
+                },
+                {"$inc": {"ai_image_gen_count": 1}},
+            )
+            if guild_update.modified_count == 0:
+                latest = data_collection.find_one(
+                    {"guild_id": guild_id, "year": year, "month": month},
+                    {"ai_image_gen_count": 1},
+                )
+                latest_used = self._to_non_negative_int(latest.get("ai_image_gen_count", 0) if latest else 0, 0)
                 return {
                     "consumed": False,
                     "reason": "guild_allowance_reached",
-                    "guild_used": guild_used,
+                    "guild_used": latest_used,
                     "guild_allowance": allowance,
                     "member_used": member_used,
                     "member_limit": member_limit,
                 }
+            guild_used_after = guild_used + 1
 
-            member_credit_reserved = False
-            if member_usage_doc is None:
-                member_usage_collection.insert_one(
-                    {
+            member_usage_collection.update_one(
+                {"guild_id": guild_id, "user_id": user_id, "year": year, "month": month},
+                {
+                    "$setOnInsert": {
                         "guild_id": guild_id,
                         "user_id": user_id,
-                        "username": username,
                         "year": year,
                         "month": month,
-                        "ai_image_gen_count": 1,
+                        "ai_image_gen_count": 0,
                         "created_at": now,
+                    },
+                    "$set": {
+                        "username": username,
                         "updated_at": now,
-                    }
-                )
-                member_credit_reserved = True
-                member_used_after = 1
-            else:
-                member_update = member_usage_collection.update_one(
-                    {
-                        "_id": member_usage_doc["_id"],
-                        "ai_image_gen_count": member_used,
                     },
-                    {
-                        "$set": {"username": username, "updated_at": now},
-                        "$inc": {"ai_image_gen_count": 1},
-                    },
-                )
-                if member_update.modified_count > 0:
-                    member_credit_reserved = True
-                    member_used_after = member_used + 1
+                },
+                upsert=True,
+            )
 
-            if not member_credit_reserved:
+            member_update = member_usage_collection.update_one(
+                {
+                    "guild_id": guild_id,
+                    "user_id": user_id,
+                    "year": year,
+                    "month": month,
+                    "ai_image_gen_count": {"$lt": member_limit},
+                },
+                {
+                    "$set": {"username": username, "updated_at": now},
+                    "$inc": {"ai_image_gen_count": 1},
+                },
+            )
+            if member_update.modified_count == 0:
                 # Roll back guild reserve if member reservation failed.
                 data_collection.update_one(
                     {"guild_id": guild_id, "year": year, "month": month, "ai_image_gen_count": {"$gte": 1}},
@@ -1060,6 +1191,7 @@ class MongoDbCog(commands.Cog):
                     "member_used": latest_member_used,
                     "member_limit": member_limit,
                 }
+            member_used_after = member_used + 1
 
             return {
                 "consumed": True,
@@ -1158,6 +1290,46 @@ class MongoDbCog(commands.Cog):
 
         return await asyncio.to_thread(_refund)
 
+    async def store_ai_image_generation_result(
+        self,
+        user_id: int,
+        username: str,
+        prompt: str,
+        mode: str,
+        model: str,
+        image_data: bytes,
+        source_filename: str = "",
+        guild_id: int | None = None,
+    ) -> str | None:
+        def _store() -> str | None:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            collection = db["ai_image_web_generations"]
+
+            if not image_data:
+                return None
+
+            doc = {
+                "user_id": user_id,
+                "username": str(username or "Unknown").strip() or "Unknown",
+                "prompt": str(prompt or "").strip(),
+                "mode": "edit" if str(mode or "").strip().lower() == "edit" else "text",
+                "source_filename": str(source_filename or "").strip(),
+                "model": str(model or "").strip() or "gpt-image-1",
+                "image_mime_type": "image/png",
+                "image_data": image_data,
+                "created_at": datetime.utcnow(),
+                "source": "discord_bot",
+            }
+            if guild_id is not None:
+                doc["guild_id"] = guild_id
+
+            result = collection.insert_one(doc)
+            return str(result.inserted_id) if result.inserted_id else None
+
+        return await asyncio.to_thread(_store)
+
     async def get_current_month_stats(self, guild_id: int) -> dict[str, Any]:
         """
         Get the usage statistics for the current month for a guild.
@@ -1229,30 +1401,25 @@ class MongoDbCog(commands.Cog):
             year = now.year
             month = now.month
 
-            record = collection.find_one({
-                "guild_id": guild_id,
-                "year": year,
-                "month": month
-            })
-
-            if not record:
-                collection.insert_one({
-                    "guild_id": guild_id,
-                    "year": year,
-                    "month": month,
-                    "translation_count": 0,
-                    "translation_character_count": character_count,
-                    "ai_image_gen_count": 0
-                })
-                return character_count
+            safe_character_count = max(int(character_count or 0), 0)
 
             collection.update_one(
                 {
                     "guild_id": guild_id,
                     "year": year,
-                    "month": month
+                    "month": month,
                 },
-                {"$inc": {"translation_character_count": character_count}}
+                {
+                    "$setOnInsert": {
+                        "guild_id": guild_id,
+                        "year": year,
+                        "month": month,
+                        "translation_count": 0,
+                        "ai_image_gen_count": 0,
+                    },
+                    "$inc": {"translation_character_count": safe_character_count},
+                },
+                upsert=True,
             )
 
             updated_record = collection.find_one({
@@ -1293,6 +1460,7 @@ class MongoDbCog(commands.Cog):
         def _ensure_indexes():
             db = self.client["discordguilds"]
             collection = db["user_data"]
+            guild_data_collection = db["guild_data"]
             ai_image_user_credits_collection = db["ai_image_user_credits"]
             ai_image_guild_member_usage_collection = db["ai_image_guild_member_usage"]
             translation_user_usage_collection = db["translation_character_user_usage"]
@@ -1318,6 +1486,18 @@ class MongoDbCog(commands.Cog):
                 [("guild_id", 1), ("level", -1)],
                 name="guild_level_idx",
             )
+            try:
+                guild_data_collection.create_index(
+                    [("guild_id", 1), ("year", 1), ("month", 1)],
+                    unique=True,
+                    name="guild_month_unique_idx",
+                )
+            except Exception:
+                # Keep startup resilient for legacy duplicate data; still add a non-unique index for query performance.
+                guild_data_collection.create_index(
+                    [("guild_id", 1), ("year", 1), ("month", 1)],
+                    name="guild_month_idx",
+                )
             ai_image_user_credits_collection.create_index(
                 [("user_id", 1)],
                 unique=True,

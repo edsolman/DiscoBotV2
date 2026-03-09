@@ -399,12 +399,13 @@ class AiImageGenerationCog(commands.Cog):
             )
             return
 
+        mongo_cog = self.bot.get_cog("MongoDbCog")
+
         consumed_credit_source = "none"
         guild_credit_snapshot: dict[str, int] = {}
         remaining_user_credits = 0
-        if interaction.guild_id is not None:
-            mongo_cog = self.bot.get_cog("MongoDbCog")
-            if mongo_cog is not None:
+        if mongo_cog is not None:
+            if interaction.guild_id is not None:
                 credit_result = await mongo_cog.consume_guild_member_ai_image_credit(
                     interaction.guild_id,
                     interaction.user.id,
@@ -468,6 +469,26 @@ class AiImageGenerationCog(commands.Cog):
 
                     consumed_credit_source = "personal"
                     remaining_user_credits = int(personal_balance_after or 0)
+            else:
+                # In DMs there is no guild context, so always enforce personal credits.
+                personal_consumed, personal_balance_after = await mongo_cog.consume_user_ai_image_credit(
+                    interaction.user.id,
+                    str(interaction.user),
+                )
+                if not personal_consumed:
+                    buy_url = await self._build_buy_credits_url(None)
+                    await interaction.response.send_message(
+                        (
+                            "⚠️ You have no personal AI credits left.\n"
+                            f"Personal credits: {personal_balance_after}\n"
+                            f"Buy more credits: {buy_url}"
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+
+                consumed_credit_source = "personal"
+                remaining_user_credits = int(personal_balance_after or 0)
 
         can_generate = True
         current_count = 0
@@ -481,7 +502,6 @@ class AiImageGenerationCog(commands.Cog):
                     f"[DEBUG] AI image request blocked by allowance: {current_count}/{allowance} used this month."
                 )
             if consumed_credit_source == "guild" and interaction.guild_id is not None:
-                mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog is not None:
                     try:
                         await mongo_cog.refund_guild_member_ai_image_credit(interaction.guild_id, interaction.user.id)
@@ -489,7 +509,6 @@ class AiImageGenerationCog(commands.Cog):
                         if self.debug:
                             print(f"[DEBUG] Failed to refund guild AI credit after allowance race: {refund_error}")
             elif consumed_credit_source == "personal":
-                mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog is not None:
                     try:
                         await mongo_cog.refund_user_ai_image_credit(interaction.user.id)
@@ -508,6 +527,7 @@ class AiImageGenerationCog(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
+            generation_mode = "edit" if image_attachment is not None else "text"
             if image_attachment is not None:
                 if self.debug:
                     print(
@@ -531,6 +551,22 @@ class AiImageGenerationCog(commands.Cog):
                 file=discord_file,
             )
 
+            if mongo_cog is not None:
+                try:
+                    await mongo_cog.store_ai_image_generation_result(
+                        user_id=interaction.user.id,
+                        username=str(interaction.user),
+                        prompt=prompt,
+                        mode=generation_mode,
+                        model="gpt-image-1",
+                        image_data=generated_image_bytes,
+                        source_filename=image_attachment.filename if image_attachment is not None else "",
+                        guild_id=interaction.guild_id,
+                    )
+                except Exception as history_error:
+                    if self.debug:
+                        print(f"[DEBUG] Failed to store AI image history row: {history_error}")
+
             if consumed_credit_source == "guild" and interaction.guild_id is not None and guild_credit_snapshot:
                 guild_used = int(guild_credit_snapshot.get("guild_used", 0) or 0)
                 guild_allowance = int(guild_credit_snapshot.get("guild_allowance", 0) or 0)
@@ -547,7 +583,6 @@ class AiImageGenerationCog(commands.Cog):
             elif consumed_credit_source == "personal":
                 monthly_credits = 0
                 active_subscriptions = 0
-                mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog is not None:
                     try:
                         subscription_summary = await mongo_cog.get_user_ai_image_subscription_summary(interaction.user.id)
@@ -577,7 +612,6 @@ class AiImageGenerationCog(commands.Cog):
                 )
         except Exception as error:
             if consumed_credit_source == "guild" and interaction.guild_id is not None:
-                mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog is not None:
                     try:
                         await mongo_cog.refund_guild_member_ai_image_credit(
@@ -588,7 +622,6 @@ class AiImageGenerationCog(commands.Cog):
                         if self.debug:
                             print(f"[DEBUG] Failed to refund guild AI credit after generation error: {refund_error}")
             elif consumed_credit_source == "personal":
-                mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog is not None:
                     try:
                         await mongo_cog.refund_user_ai_image_credit(interaction.user.id)
