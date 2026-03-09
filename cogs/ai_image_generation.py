@@ -378,45 +378,6 @@ class AiImageGenerationCog(commands.Cog):
             )
             return
 
-        can_generate, current_count, allowance = await self._check_ai_image_limit(interaction.guild_id)
-        if not can_generate:
-            if self.debug:
-                print(
-                    f"[DEBUG] AI image request blocked by allowance: {current_count}/{allowance} used this month."
-                )
-            await interaction.response.send_message(
-                (
-                    "⚠️ AI image generation limit exceeded! "
-                    f"This server has used {current_count}/{allowance} images this month."
-                ),
-                ephemeral=True,
-            )
-            return
-
-        credit_was_consumed = False
-        remaining_user_credits = 0
-        if interaction.guild_id is not None:
-            mongo_cog = self.bot.get_cog("MongoDbCog")
-            if mongo_cog is not None:
-                consumed, balance_after = await mongo_cog.consume_user_ai_image_credit(
-                    interaction.user.id,
-                    str(interaction.user),
-                )
-                if not consumed:
-                    buy_url = await self._build_buy_credits_url(interaction.guild_id)
-                    await interaction.response.send_message(
-                        (
-                            "⚠️ You have no AI image credits left.\n"
-                            f"Current balance: {balance_after}\n"
-                            f"Buy more credits: {buy_url}"
-                        ),
-                        ephemeral=True,
-                    )
-                    return
-
-                credit_was_consumed = True
-                remaining_user_credits = balance_after
-
         prompt = (message.content or "").strip()
         image_attachment = self._get_image_attachment(message)
 
@@ -434,6 +395,112 @@ class AiImageGenerationCog(commands.Cog):
                 print("[DEBUG] AI image request blocked: image attachment provided without text instructions.")
             await interaction.response.send_message(
                 "Please include text in the selected message describing how to transform the attached image.",
+                ephemeral=True,
+            )
+            return
+
+        consumed_credit_source = "none"
+        guild_credit_snapshot: dict[str, int] = {}
+        remaining_user_credits = 0
+        if interaction.guild_id is not None:
+            mongo_cog = self.bot.get_cog("MongoDbCog")
+            if mongo_cog is not None:
+                credit_result = await mongo_cog.consume_guild_member_ai_image_credit(
+                    interaction.guild_id,
+                    interaction.user.id,
+                    str(interaction.user),
+                )
+                if credit_result.get("consumed", False):
+                    consumed_credit_source = "guild"
+                    guild_credit_snapshot = {
+                        "guild_used": int(credit_result.get("guild_used", 0) or 0),
+                        "guild_allowance": int(credit_result.get("guild_allowance", 0) or 0),
+                        "member_used": int(credit_result.get("member_used", 0) or 0),
+                        "member_limit": int(credit_result.get("member_limit", 0) or 0),
+                    }
+                else:
+                    # Fallback to personal credits if guild allocation cannot be used.
+                    personal_consumed, personal_balance_after = await mongo_cog.consume_user_ai_image_credit(
+                        interaction.user.id,
+                        str(interaction.user),
+                    )
+                    if not personal_consumed:
+                        reason = str(credit_result.get("reason", ""))
+                        guild_used = int(credit_result.get("guild_used", 0) or 0)
+                        guild_allowance = int(credit_result.get("guild_allowance", 0) or 0)
+                        member_used = int(credit_result.get("member_used", 0) or 0)
+                        member_limit = int(credit_result.get("member_limit", 0) or 0)
+                        buy_url = await self._build_buy_credits_url(interaction.guild_id)
+
+                        if reason == "member_allocation_zero":
+                            await interaction.response.send_message(
+                                (
+                                    "⚠️ You have no Guild AI allocation and no personal AI credits left.\n"
+                                    f"Personal credits: {personal_balance_after}\n"
+                                    f"Buy more credits: {buy_url}"
+                                ),
+                                ephemeral=True,
+                            )
+                            return
+
+                        if reason == "member_cap_reached":
+                            await interaction.response.send_message(
+                                (
+                                    "⚠️ Your Guild AI allocation is used up and you have no personal AI credits left.\n"
+                                    f"Guild allocation usage: {member_used}/{member_limit}\n"
+                                    f"Personal credits: {personal_balance_after}\n"
+                                    f"Buy more credits: {buy_url}"
+                                ),
+                                ephemeral=True,
+                            )
+                            return
+
+                        await interaction.response.send_message(
+                            (
+                                "⚠️ This server has no Guild AI credits available and you have no personal AI credits left.\n"
+                                f"Server usage: {guild_used}/{guild_allowance}\n"
+                                f"Personal credits: {personal_balance_after}\n"
+                                f"Buy more credits: {buy_url}"
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+
+                    consumed_credit_source = "personal"
+                    remaining_user_credits = int(personal_balance_after or 0)
+
+        can_generate = True
+        current_count = 0
+        allowance = 0
+        if consumed_credit_source != "personal":
+            can_generate, current_count, allowance = await self._check_ai_image_limit(interaction.guild_id)
+
+        if not can_generate:
+            if self.debug:
+                print(
+                    f"[DEBUG] AI image request blocked by allowance: {current_count}/{allowance} used this month."
+                )
+            if consumed_credit_source == "guild" and interaction.guild_id is not None:
+                mongo_cog = self.bot.get_cog("MongoDbCog")
+                if mongo_cog is not None:
+                    try:
+                        await mongo_cog.refund_guild_member_ai_image_credit(interaction.guild_id, interaction.user.id)
+                    except Exception as refund_error:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to refund guild AI credit after allowance race: {refund_error}")
+            elif consumed_credit_source == "personal":
+                mongo_cog = self.bot.get_cog("MongoDbCog")
+                if mongo_cog is not None:
+                    try:
+                        await mongo_cog.refund_user_ai_image_credit(interaction.user.id)
+                    except Exception as refund_error:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to refund personal AI credit after allowance race: {refund_error}")
+            await interaction.response.send_message(
+                (
+                    "⚠️ AI image generation limit exceeded! "
+                    f"This server has used {current_count}/{allowance} images this month."
+                ),
                 ephemeral=True,
             )
             return
@@ -458,77 +525,76 @@ class AiImageGenerationCog(commands.Cog):
                     print(f"[DEBUG] AI image request mode: text-only generation with prompt length {len(prompt)}.")
                 generated_image_bytes = await asyncio.to_thread(self._generate_from_text, prompt)
 
-            if interaction.guild_id is not None:
-                mongo_cog = self.bot.get_cog("MongoDbCog")
-                if mongo_cog is not None:
-                    try:
-                        new_count = await mongo_cog.increment_ai_image_count(interaction.guild_id)
-                        if self.debug:
-                            stats = await mongo_cog.get_current_month_stats(interaction.guild_id)
-                            allowance_value = stats.get("aiimagegenallowance", 50) if stats else 50
-                            remaining = max(allowance_value - new_count, 0)
-                            print(
-                                f"[DEBUG] AI image usage: used 1 image; total {new_count}/{allowance_value}; remaining {remaining}."
-                            )
-                    except Exception as error:
-                        if self.debug:
-                            print(f"[DEBUG] Error incrementing AI image count: {error}")
-
             discord_file = discord.File(io.BytesIO(generated_image_bytes), filename="generated-ai-image.png")
             await interaction.followup.send(
                 content="Here's your AI-generated image, we hope you like it!",
                 file=discord_file,
             )
 
-            monthly_credits = 0
-            active_subscriptions = 0
-            mongo_cog = self.bot.get_cog("MongoDbCog")
-            if mongo_cog is not None:
-                try:
-                    subscription_summary = await mongo_cog.get_user_ai_image_subscription_summary(interaction.user.id)
-                    monthly_credits = int(subscription_summary.get("monthly_credits", 0) or 0)
-                    active_subscriptions = int(subscription_summary.get("active_subscriptions", 0) or 0)
-                except Exception as subscription_error:
-                    if self.debug:
-                        print(f"[DEBUG] Failed to fetch subscription summary: {subscription_error}")
-
-            single_purchase_credits_remaining = max(remaining_user_credits - monthly_credits, 0)
-            total_credits_this_month = single_purchase_credits_remaining + monthly_credits
-
-            if self.debug:
-                print(
-                    "[DEBUG] AI image user credits: "
-                    f"raw_wallet_balance={remaining_user_credits}, "
-                    f"single_purchase_remaining={single_purchase_credits_remaining}, "
-                    f"monthly_subscription_credits={monthly_credits}, "
-                    f"total_credits_this_month={total_credits_this_month}, "
-                    f"active_subscriptions={active_subscriptions}."
+            if consumed_credit_source == "guild" and interaction.guild_id is not None and guild_credit_snapshot:
+                guild_used = int(guild_credit_snapshot.get("guild_used", 0) or 0)
+                guild_allowance = int(guild_credit_snapshot.get("guild_allowance", 0) or 0)
+                member_used = int(guild_credit_snapshot.get("member_used", 0) or 0)
+                member_limit = int(guild_credit_snapshot.get("member_limit", 0) or 0)
+                await interaction.followup.send(
+                    content=(
+                        "Guild AI credit usage this month:\n"
+                        f"- Server usage: {guild_used}/{guild_allowance}\n"
+                        f"- Your allocation usage: {member_used}/{member_limit}"
+                    ),
+                    ephemeral=True,
                 )
+            elif consumed_credit_source == "personal":
+                monthly_credits = 0
+                active_subscriptions = 0
+                mongo_cog = self.bot.get_cog("MongoDbCog")
+                if mongo_cog is not None:
+                    try:
+                        subscription_summary = await mongo_cog.get_user_ai_image_subscription_summary(interaction.user.id)
+                        monthly_credits = int(subscription_summary.get("monthly_credits", 0) or 0)
+                        active_subscriptions = int(subscription_summary.get("active_subscriptions", 0) or 0)
+                    except Exception as subscription_error:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to fetch subscription summary: {subscription_error}")
 
-            subscription_text = (
-                f"Monthly subscription credits: {monthly_credits}/month "
-                f"({active_subscriptions} active subscription{'s' if active_subscriptions != 1 else ''})"
-                if active_subscriptions > 0
-                else "No active subscription"
-            )
-            await interaction.followup.send(
-                content=(
-                    "Your AI credit details:\n"
-                    f"- Single purchase credits remaining: {single_purchase_credits_remaining}\n"
-                    f"- {subscription_text}\n"
-                    f"- Total credits this month (single + subscription): {total_credits_this_month}"
-                ),
-                ephemeral=True,
-            )
+                single_purchase_credits_remaining = max(remaining_user_credits - monthly_credits, 0)
+                total_credits_this_month = single_purchase_credits_remaining + monthly_credits
+                subscription_text = (
+                    f"Monthly subscription credits: {monthly_credits}/month "
+                    f"({active_subscriptions} active subscription{'s' if active_subscriptions != 1 else ''})"
+                    if active_subscriptions > 0
+                    else "No active subscription"
+                )
+                await interaction.followup.send(
+                    content=(
+                        "Used personal AI credits for this generation (Guild credits unavailable).\n"
+                        "Your personal AI credit details:\n"
+                        f"- Single purchase credits remaining: {single_purchase_credits_remaining}\n"
+                        f"- {subscription_text}\n"
+                        f"- Total credits this month (single + subscription): {total_credits_this_month}"
+                    ),
+                    ephemeral=True,
+                )
         except Exception as error:
-            if credit_was_consumed and interaction.guild_id is not None:
+            if consumed_credit_source == "guild" and interaction.guild_id is not None:
+                mongo_cog = self.bot.get_cog("MongoDbCog")
+                if mongo_cog is not None:
+                    try:
+                        await mongo_cog.refund_guild_member_ai_image_credit(
+                            interaction.guild_id,
+                            interaction.user.id,
+                        )
+                    except Exception as refund_error:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to refund guild AI credit after generation error: {refund_error}")
+            elif consumed_credit_source == "personal":
                 mongo_cog = self.bot.get_cog("MongoDbCog")
                 if mongo_cog is not None:
                     try:
                         await mongo_cog.refund_user_ai_image_credit(interaction.user.id)
                     except Exception as refund_error:
                         if self.debug:
-                            print(f"[DEBUG] Failed to refund AI image credit after generation error: {refund_error}")
+                            print(f"[DEBUG] Failed to refund personal AI credit after generation error: {refund_error}")
 
             if self.debug:
                 print(f"[DEBUG] AI image generation failed: {error}")

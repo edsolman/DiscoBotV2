@@ -25,6 +25,53 @@ class MongoDbCog(commands.Cog):
         "unpaid",
     )
 
+    @staticmethod
+    def _to_non_negative_int(value: Any, default: int = 0) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(parsed, 0)
+
+    @classmethod
+    def _normalize_ai_image_credit_policy(
+        cls,
+        raw_policy: Any,
+        fallback_default_limit: int,
+    ) -> dict[str, Any]:
+        has_policy = isinstance(raw_policy, dict)
+        policy = raw_policy if isinstance(raw_policy, dict) else {}
+
+        default_limit = (
+            cls._to_non_negative_int(policy.get("default_monthly_credits_per_member"), 0)
+            if has_policy
+            else max(int(fallback_default_limit), 0)
+        )
+
+        seen_user_ids: set[str] = set()
+        member_overrides: list[dict[str, Any]] = []
+        for row in policy.get("member_overrides", []) if isinstance(policy.get("member_overrides"), list) else []:
+            user_id = str((row or {}).get("user_id", "")).strip()
+            if not user_id or user_id in seen_user_ids:
+                continue
+
+            seen_user_ids.add(user_id)
+            username = str((row or {}).get("username") or user_id).strip()[:64] or user_id
+            monthly_credits = cls._to_non_negative_int((row or {}).get("monthly_credits_per_month"), 0)
+            member_overrides.append(
+                {
+                    "user_id": user_id,
+                    "username": username,
+                    "monthly_credits_per_month": monthly_credits,
+                }
+            )
+
+        return {
+            "has_policy": has_policy,
+            "default_monthly_credits_per_member": default_limit,
+            "member_overrides": member_overrides,
+        }
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._mongodb_uri = os.environ.get("MONGODB_URI")
@@ -829,6 +876,258 @@ class MongoDbCog(commands.Cog):
 
         return await asyncio.to_thread(_consume)
 
+    async def consume_guild_member_ai_image_credit(
+        self,
+        guild_id: int,
+        user_id: int,
+        username: str,
+    ) -> dict[str, Any]:
+        def _consume() -> dict[str, Any]:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            guilds_collection = db["guilds"]
+            data_collection = db["guild_data"]
+            member_usage_collection = db["ai_image_guild_member_usage"]
+
+            now = datetime.utcnow()
+            year = now.year
+            month = now.month
+
+            guild = guilds_collection.find_one({"guild_id": guild_id})
+            allowance = self._to_non_negative_int(guild.get("aiimagegenallowance", 50) if guild else 50, 50)
+            policy = self._normalize_ai_image_credit_policy(
+                guild.get("ai_image_credit_policy") if isinstance(guild, dict) else None,
+                allowance,
+            )
+
+            user_id_str = str(user_id)
+            override_limit = None
+            for row in policy.get("member_overrides", []):
+                if str(row.get("user_id", "")).strip() == user_id_str:
+                    override_limit = self._to_non_negative_int(row.get("monthly_credits_per_month"), 0)
+                    break
+
+            member_limit = (
+                override_limit
+                if override_limit is not None
+                else self._to_non_negative_int(policy.get("default_monthly_credits_per_member"), allowance)
+            )
+
+            monthly_guild_data = data_collection.find_one(
+                {"guild_id": guild_id, "year": year, "month": month},
+                {"ai_image_gen_count": 1},
+            )
+            guild_used = self._to_non_negative_int(monthly_guild_data.get("ai_image_gen_count", 0) if monthly_guild_data else 0, 0)
+
+            member_usage_doc = member_usage_collection.find_one(
+                {"guild_id": guild_id, "user_id": user_id, "year": year, "month": month},
+                {"ai_image_gen_count": 1},
+            )
+            member_used = self._to_non_negative_int(member_usage_doc.get("ai_image_gen_count", 0) if member_usage_doc else 0, 0)
+
+            if allowance <= 0 or guild_used >= allowance:
+                return {
+                    "consumed": False,
+                    "reason": "guild_allowance_reached",
+                    "guild_used": guild_used,
+                    "guild_allowance": allowance,
+                    "member_used": member_used,
+                    "member_limit": member_limit,
+                }
+
+            if member_limit <= 0:
+                return {
+                    "consumed": False,
+                    "reason": "member_allocation_zero",
+                    "guild_used": guild_used,
+                    "guild_allowance": allowance,
+                    "member_used": member_used,
+                    "member_limit": member_limit,
+                }
+
+            if member_used >= member_limit:
+                return {
+                    "consumed": False,
+                    "reason": "member_cap_reached",
+                    "guild_used": guild_used,
+                    "guild_allowance": allowance,
+                    "member_used": member_used,
+                    "member_limit": member_limit,
+                }
+
+            # Reserve 1 guild credit using optimistic concurrency to reduce race over-allocation.
+            guild_credit_reserved = False
+            if monthly_guild_data is None:
+                data_collection.insert_one(
+                    {
+                        "guild_id": guild_id,
+                        "year": year,
+                        "month": month,
+                        "translation_count": 0,
+                        "translation_character_count": 0,
+                        "ai_image_gen_count": 1,
+                    }
+                )
+                guild_credit_reserved = True
+                guild_used_after = 1
+            else:
+                guild_update = data_collection.update_one(
+                    {
+                        "_id": monthly_guild_data["_id"],
+                        "ai_image_gen_count": guild_used,
+                    },
+                    {"$inc": {"ai_image_gen_count": 1}},
+                )
+                if guild_update.modified_count > 0:
+                    guild_credit_reserved = True
+                    guild_used_after = guild_used + 1
+                else:
+                    latest = data_collection.find_one(
+                        {"guild_id": guild_id, "year": year, "month": month},
+                        {"ai_image_gen_count": 1},
+                    )
+                    latest_used = self._to_non_negative_int(latest.get("ai_image_gen_count", 0) if latest else 0, 0)
+                    return {
+                        "consumed": False,
+                        "reason": "guild_allowance_reached",
+                        "guild_used": latest_used,
+                        "guild_allowance": allowance,
+                        "member_used": member_used,
+                        "member_limit": member_limit,
+                    }
+
+            if not guild_credit_reserved:
+                return {
+                    "consumed": False,
+                    "reason": "guild_allowance_reached",
+                    "guild_used": guild_used,
+                    "guild_allowance": allowance,
+                    "member_used": member_used,
+                    "member_limit": member_limit,
+                }
+
+            member_credit_reserved = False
+            if member_usage_doc is None:
+                member_usage_collection.insert_one(
+                    {
+                        "guild_id": guild_id,
+                        "user_id": user_id,
+                        "username": username,
+                        "year": year,
+                        "month": month,
+                        "ai_image_gen_count": 1,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                member_credit_reserved = True
+                member_used_after = 1
+            else:
+                member_update = member_usage_collection.update_one(
+                    {
+                        "_id": member_usage_doc["_id"],
+                        "ai_image_gen_count": member_used,
+                    },
+                    {
+                        "$set": {"username": username, "updated_at": now},
+                        "$inc": {"ai_image_gen_count": 1},
+                    },
+                )
+                if member_update.modified_count > 0:
+                    member_credit_reserved = True
+                    member_used_after = member_used + 1
+
+            if not member_credit_reserved:
+                # Roll back guild reserve if member reservation failed.
+                data_collection.update_one(
+                    {"guild_id": guild_id, "year": year, "month": month, "ai_image_gen_count": {"$gte": 1}},
+                    {"$inc": {"ai_image_gen_count": -1}},
+                )
+                latest_member = member_usage_collection.find_one(
+                    {"guild_id": guild_id, "user_id": user_id, "year": year, "month": month},
+                    {"ai_image_gen_count": 1},
+                )
+                latest_member_used = self._to_non_negative_int(
+                    latest_member.get("ai_image_gen_count", 0) if latest_member else 0,
+                    0,
+                )
+                return {
+                    "consumed": False,
+                    "reason": "member_cap_reached",
+                    "guild_used": max(guild_used_after - 1, 0),
+                    "guild_allowance": allowance,
+                    "member_used": latest_member_used,
+                    "member_limit": member_limit,
+                }
+
+            return {
+                "consumed": True,
+                "reason": "ok",
+                "guild_used": guild_used_after,
+                "guild_allowance": allowance,
+                "member_used": member_used_after,
+                "member_limit": member_limit,
+            }
+
+        return await asyncio.to_thread(_consume)
+
+    async def refund_guild_member_ai_image_credit(
+        self,
+        guild_id: int,
+        user_id: int,
+    ) -> dict[str, int]:
+        def _refund() -> dict[str, int]:
+            from datetime import datetime
+
+            db = self.client["discordguilds"]
+            data_collection = db["guild_data"]
+            member_usage_collection = db["ai_image_guild_member_usage"]
+
+            now = datetime.utcnow()
+            year = now.year
+            month = now.month
+
+            data_collection.update_one(
+                {
+                    "guild_id": guild_id,
+                    "year": year,
+                    "month": month,
+                    "ai_image_gen_count": {"$gte": 1},
+                },
+                {"$inc": {"ai_image_gen_count": -1}},
+            )
+
+            member_usage_collection.update_one(
+                {
+                    "guild_id": guild_id,
+                    "user_id": user_id,
+                    "year": year,
+                    "month": month,
+                    "ai_image_gen_count": {"$gte": 1},
+                },
+                {
+                    "$set": {"updated_at": now},
+                    "$inc": {"ai_image_gen_count": -1},
+                },
+            )
+
+            guild_doc = data_collection.find_one(
+                {"guild_id": guild_id, "year": year, "month": month},
+                {"ai_image_gen_count": 1},
+            )
+            member_doc = member_usage_collection.find_one(
+                {"guild_id": guild_id, "user_id": user_id, "year": year, "month": month},
+                {"ai_image_gen_count": 1},
+            )
+
+            return {
+                "guild_used": self._to_non_negative_int(guild_doc.get("ai_image_gen_count", 0) if guild_doc else 0, 0),
+                "member_used": self._to_non_negative_int(member_doc.get("ai_image_gen_count", 0) if member_doc else 0, 0),
+            }
+
+        return await asyncio.to_thread(_refund)
+
     async def refund_user_ai_image_credit(
         self,
         user_id: int,
@@ -995,6 +1294,7 @@ class MongoDbCog(commands.Cog):
             db = self.client["discordguilds"]
             collection = db["user_data"]
             ai_image_user_credits_collection = db["ai_image_user_credits"]
+            ai_image_guild_member_usage_collection = db["ai_image_guild_member_usage"]
             translation_user_usage_collection = db["translation_character_user_usage"]
             translation_subscriptions_collection = db["translation_character_subscriptions"]
             collection.create_index(
@@ -1022,6 +1322,11 @@ class MongoDbCog(commands.Cog):
                 [("user_id", 1)],
                 unique=True,
                 name="user_credit_wallet_unique_idx",
+            )
+            ai_image_guild_member_usage_collection.create_index(
+                [("guild_id", 1), ("user_id", 1), ("year", 1), ("month", 1)],
+                unique=True,
+                name="ai_image_guild_member_month_unique_idx",
             )
             translation_user_usage_collection.create_index(
                 [("user_id", 1), ("year", 1), ("month", 1)],
