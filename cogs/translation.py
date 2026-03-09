@@ -155,24 +155,6 @@ class TranslationCog(commands.Cog):
                     print(f"[DEBUG] Could not resolve channel {payload.channel_id} for reaction translation: {e}")
                 return
 
-        # Check translation limit if this is in a guild
-        if payload.guild_id:
-            mongo_cog = self.bot.get_cog("MongoDbCog")
-            if mongo_cog:
-                try:
-                    can_translate, current_count, allowance = await mongo_cog.check_translation_limit(payload.guild_id)
-                    if not can_translate:
-                        await self._send_private_limit_notice(
-                            payload.user_id,
-                            channel,
-                            f"⚠️ Translation limit exceeded! This server has used {current_count}/{allowance} translations this month."
-                        )
-                        return
-                except Exception as e:
-                    if self.debug:
-                        print(f"[DEBUG] Error checking translation limit: {e}")
-                    # Continue with translation if we can't check the limit
-
         message = await channel.fetch_message(payload.message_id)
         member = payload.member
         if member is None and payload.guild_id:
@@ -404,23 +386,6 @@ class TranslationCog(commands.Cog):
             )
             return
 
-        # Check translation limit
-        if interaction.guild_id:
-            mongo_cog = self.bot.get_cog("MongoDbCog")
-            if mongo_cog:
-                try:
-                    can_translate, current_count, allowance = await mongo_cog.check_translation_limit(interaction.guild_id)
-                    if not can_translate:
-                        await interaction.response.send_message(
-                            f"⚠️ Translation limit exceeded! This server has used {current_count}/{allowance} translations this month.",
-                            ephemeral=True
-                        )
-                        return
-                except Exception as e:
-                    if self.debug:
-                        print(f"[DEBUG] Error checking translation limit: {e}")
-                    # Continue with translation if we can't check the limit
-
         target_locale = str(interaction.locale)
         target_deepl_locale = "Unknown"
         target_language_name = "Unknown"
@@ -605,23 +570,6 @@ class TranslationCog(commands.Cog):
                 ephemeral=True,
             )
             return
-
-        # Check translation limit
-        if interaction.guild_id:
-            mongo_cog = self.bot.get_cog("MongoDbCog")
-            if mongo_cog:
-                try:
-                    can_translate, current_count, allowance = await mongo_cog.check_translation_limit(interaction.guild_id)
-                    if not can_translate:
-                        await interaction.response.send_message(
-                            f"⚠️ Translation limit exceeded! This server has used {current_count}/{allowance} translations this month.",
-                            ephemeral=True
-                        )
-                        return
-                except Exception as e:
-                    if self.debug:
-                        print(f"[DEBUG] Error checking translation limit: {e}")
-                    # Continue with translation if we can't check the limit
 
         target_locale = str(interaction.locale)
         target_deepl_locale = "Unknown"

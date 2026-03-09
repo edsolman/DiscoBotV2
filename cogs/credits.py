@@ -154,10 +154,7 @@ class CreditsCog(commands.Cog):
         ai_used = self._to_int(usage_doc.get("ai_image_gen_count", 0))
         ai_remaining = max(ai_allowance - ai_used, 0)
 
-        tr_msg_allowance = self._to_int(guild_doc.get("translationallowance", 0))
         tr_msg_used = self._to_int(usage_doc.get("translation_count", 0))
-        tr_msg_remaining = max(tr_msg_allowance - tr_msg_used, 0)
-
         tr_char_allowance = self._to_int(guild_doc.get("translationcharacterallowance", 0))
         tr_char_used = self._to_int(usage_doc.get("translation_character_count", 0))
         tr_char_remaining = max(tr_char_allowance - tr_char_used, 0)
@@ -211,9 +208,7 @@ class CreditsCog(commands.Cog):
         embed.add_field(
             name="Translation Credits",
             value=(
-                f"Message allowance: **{self._fmt(tr_msg_allowance)}**\n"
-                f"Messages used: **{self._fmt(tr_msg_used)}**\n"
-                f"Messages remaining: **{self._fmt(tr_msg_remaining)}**\n"
+                f"Messages translated: **{self._fmt(tr_msg_used)}**\n"
                 f"Character allowance: **{self._fmt(tr_char_allowance)}**\n"
                 f"Characters used: **{self._fmt(tr_char_used)}**\n"
                 f"Characters remaining: **{self._fmt(tr_char_remaining)}**\n"
